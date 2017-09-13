@@ -111,9 +111,24 @@ public final class HttpServerCodec extends CombinedChannelDuplexHandler<HttpRequ
 
     private final class HttpServerResponseEncoder extends HttpResponseEncoder {
 
+        private HttpMethod method;
+
+        @Override
+        protected void filterMessage(HttpResponse msg, boolean isAlwaysEmpty) {
+            if (!isAlwaysEmpty && method == HttpMethod.CONNECT && msg.status().codeClass() == HttpStatusClass.SUCCESS) {
+                // Stripping Transfer-Encoding:
+                // See https://tools.ietf.org/html/rfc7230#section-3.3.1
+                msg.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
+                return;
+            }
+
+            super.filterMessage(msg, isAlwaysEmpty);
+        }
+
         @Override
         protected boolean isContentAlwaysEmpty(@SuppressWarnings("unused") HttpResponse msg) {
-            return HttpMethod.HEAD.equals(queue.poll());
+            method = queue.poll();
+            return HttpMethod.HEAD.equals(method) || super.isContentAlwaysEmpty(msg);
         }
     }
 }
