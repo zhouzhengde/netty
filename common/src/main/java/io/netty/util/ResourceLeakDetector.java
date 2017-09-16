@@ -23,11 +23,8 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
-import java.util.ArrayDeque;
-import java.util.Deque;
 import java.util.concurrent.ConcurrentMap;
 
-import static io.netty.util.internal.EmptyArrays.EMPTY_OBJECTS;
 import static io.netty.util.internal.StringUtil.EMPTY_STRING;
 import static io.netty.util.internal.StringUtil.NEWLINE;
 import static io.netty.util.internal.StringUtil.simpleClassName;
@@ -245,18 +242,18 @@ public class ResourceLeakDetector<T> {
 
         if (level.ordinal() < Level.PARANOID.ordinal()) {
             if ((PlatformDependent.threadLocalRandom().nextInt(samplingInterval)) == 0) {
-                reportLeak(level);
+                reportLeak();
                 return new DefaultResourceLeak(obj);
             } else {
                 return null;
             }
         } else {
-            reportLeak(level);
+            reportLeak();
             return new DefaultResourceLeak(obj);
         }
     }
 
-    private void reportLeak(Level level) {
+    private void reportLeak() {
         if (!logger.isErrorEnabled()) {
             for (;;) {
                 @SuppressWarnings("unchecked")
@@ -328,11 +325,11 @@ public class ResourceLeakDetector<T> {
     @SuppressWarnings("deprecation")
     private final class DefaultResourceLeak extends PhantomReference<Object> implements ResourceLeakTracker<T>,
             ResourceLeak {
-        private final String creationRecord;
-        private final Deque<String> lastRecords;
-        private final int trackedHash;
+        private final Record head;
+        private Record tail;
 
-        private int removedRecords;
+        private final int trackedHash;
+        private int numRecords;
 
         DefaultResourceLeak(Object referent) {
             super(referent, refQueue);
@@ -343,42 +340,29 @@ public class ResourceLeakDetector<T> {
             // It's important that we not store a reference to the referent as this would disallow it from
             // be collected via the PhantomReference.
             trackedHash = System.identityHashCode(referent);
-
-            Level level = getLevel();
-            if (level.ordinal() >= Level.ADVANCED.ordinal()) {
-                creationRecord = newRecord(null, 3);
-                lastRecords = new ArrayDeque<String>();
-            } else {
-                creationRecord = null;
-                lastRecords = null;
-            }
+            head = tail = getLevel().ordinal() >= Level.ADVANCED.ordinal() ? new Record() : null;
             allLeaks.put(this, LeakEntry.INSTANCE);
         }
 
         @Override
         public void record() {
-            record0(null, 3);
+            record0(null);
         }
 
         @Override
         public void record(Object hint) {
-            record0(hint, 3);
+            record0(hint);
         }
 
-        private void record0(Object hint, int recordsToSkip) {
+        private void record0(Object hint) {
             // Check MAX_RECORDS > 0 here to avoid similar check before remove from and add to lastRecords
-            if (creationRecord != null && MAX_RECORDS > 0) {
-                String value = newRecord(hint, recordsToSkip);
+            if (head != null && MAX_RECORDS > 0) {
+                Record record = hint == null ? new Record() : new Record(hint);
 
-                synchronized (lastRecords) {
-                    int size = lastRecords.size();
-                    if (size == 0 || !lastRecords.getLast().equals(value)) {
-                        if (size >= MAX_RECORDS) {
-                            lastRecords.removeFirst();
-                            ++removedRecords;
-                        }
-                        lastRecords.add(value);
-                    }
+                synchronized (head) {
+                    tail.next = record;
+                    tail = record;
+                    numRecords++;
                 }
             }
         }
@@ -403,21 +387,29 @@ public class ResourceLeakDetector<T> {
 
         @Override
         public String toString() {
-            if (creationRecord == null) {
+            if (head == null) {
                 return EMPTY_STRING;
             }
 
-            final Object[] array;
-            final int removedRecords;
-            if (lastRecords != null) {
-                synchronized (lastRecords) {
-                    array = lastRecords.toArray();
-                    removedRecords = this.removedRecords;
+            final String creationRecord = head.toString();
+            final String[] array;
+            int idx = 0;
+
+            synchronized (head) {
+                String last = null;
+                array = new String[numRecords];
+                Record record = head.next;
+                while (record != null) {
+                    String recordStr = record.toString();
+                    if (last == null || !last.equals(recordStr)) {
+                        array[idx ++] = recordStr;
+                        last = recordStr;
+                    }
+                    record = record.next;
                 }
-            } else {
-                removedRecords = 0;
-                array = EMPTY_OBJECTS;
             }
+
+            int removedRecords = idx > MAX_RECORDS ? idx - MAX_RECORDS : 0;
 
             StringBuilder buf = new StringBuilder(16384).append(NEWLINE);
             if (removedRecords > 0) {
@@ -430,12 +422,13 @@ public class ResourceLeakDetector<T> {
                 .append(" to increase the limit.")
                 .append(NEWLINE);
             }
-            buf.append("Recent access records: ")
-            .append(array.length)
-            .append(NEWLINE);
 
-            if (array.length > 0) {
-                for (int i = array.length - 1; i >= 0; i --) {
+            int records = idx - removedRecords;
+            buf.append("Recent access records: ").append(records).append(NEWLINE);
+
+            if (records > 0) {
+                // Drop the skipped records.
+                for (int i = records - 1; i >= 0; i --) {
                     buf.append('#')
                        .append(i + 1)
                        .append(':')
@@ -460,47 +453,45 @@ public class ResourceLeakDetector<T> {
             "io.netty.buffer.AdvancedLeakAwareByteBuf.recordLeakNonRefCountingOperation("
     };
 
-    static String newRecord(Object hint, int recordsToSkip) {
-        StringBuilder buf = new StringBuilder(4096);
+    private static final class Record extends Throwable {
+        private final String hintString;
+        private Record next;
 
-        // Append the hint first if available.
-        if (hint != null) {
-            buf.append("\tHint: ");
-            // Prefer a hint string to a simple string form.
-            if (hint instanceof ResourceLeakHint) {
-                buf.append(((ResourceLeakHint) hint).toHintString());
-            } else {
-                buf.append(hint);
-            }
-            buf.append(NEWLINE);
+        Record(Object hint) {
+            // This needs to be generated even if toString() is never called as it may change later on.
+            hintString = hint instanceof ResourceLeakHint ? ((ResourceLeakHint) hint).toHintString() : hint.toString();
         }
 
-        // Append the stack trace.
-        StackTraceElement[] array = new Throwable().getStackTrace();
-        for (StackTraceElement e: array) {
-            if (recordsToSkip > 0) {
-                recordsToSkip --;
-            } else {
-                String estr = e.toString();
+        Record() {
+           hintString = null;
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder buf = new StringBuilder(4096);
+            if (hintString != null) {
+                buf.append("\tHint: ").append(hintString).append(NEWLINE);
+            }
+
+            // Append the stack trace.
+            StackTraceElement[] array = getStackTrace();
+            // Skip the first three elements.
+            outer: for (int i = 3; i < array.length; i++) {
+                String estr = array[i].toString();
 
                 // Strip the noisy stack trace elements.
-                boolean excluded = false;
                 for (String exclusion: STACK_TRACE_ELEMENT_EXCLUSIONS) {
                     if (estr.startsWith(exclusion)) {
-                        excluded = true;
-                        break;
+                        continue outer;
                     }
                 }
-
-                if (!excluded) {
-                    buf.append('\t');
-                    buf.append(estr);
-                    buf.append(NEWLINE);
-                }
+                buf.append('\t');
+                buf.append(estr);
+                buf.append(NEWLINE);
             }
-        }
 
-        return buf.toString();
+            return buf.toString();
+        }
     }
 
     private static final class LeakEntry {
